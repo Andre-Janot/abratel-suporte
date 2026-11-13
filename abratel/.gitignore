@@ -1,0 +1,2 @@
+# O .gitignore da raiz do RustDesk ignora *png; os PNGs da marca precisam ir para o repositório.
+!*.png

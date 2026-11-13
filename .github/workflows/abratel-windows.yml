@@ -1,0 +1,288 @@
+# Abratel Suporte — cliente Windows x64 do RustDesk com a marca da Abratel e o servidor fixo.
+#
+# Fica em .github/workflows/ do repositório Andre-Janot/abratel-suporte, branch "abratel"
+# (= árvore de uma tag oficial do rustdesk/rustdesk + 1 commit que só ACRESCENTA abratel/ e este arquivo).
+# É o job "build-for-windows-flutter" (x86_64) do flutter-build.yml oficial, sem MSI e arm64,
+# com um passo a mais (abratel/aplicar-marca.py) e assinatura própria opcional (SSL.com eSigner, secrets ES_*).
+# As versões de Flutter/Rust/LLVM/vcpkg são lidas do flutter-build.yml da própria tag, então
+# trocar de versão do RustDesk não exige editar este arquivo (veja o README do Hallo).
+name: Abratel Suporte (Windows x64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [abratel]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: abratel-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Servidor e chave fixos no código vêm dos secrets HALLO_HOST e HALLO_KEY do repositório (o GitHub os esconde
+  # nos logs como ***). Sem eles o build para no passo "Aplicar marca".
+  HALLO_HOST: ${{ secrets.HALLO_HOST }}
+  HALLO_KEY: ${{ secrets.HALLO_KEY }}
+  HALLO_PORTAL: ${{ secrets.HALLO_PORTAL }}   # portal da empresa, para a lista de atendentes na tela inicial
+  APP_EXE: AbratelSuporte.exe
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  build-RustDeskTempTopMostWindow:
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      upload-artifact: true
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+
+  windows-x64:
+    name: Abratel Suporte x86_64
+    needs: [build-RustDeskTempTopMostWindow, generate-bridge]
+    runs-on: windows-2022
+    env:
+      # Assinatura de código (SSL.com eSigner). Sem os secrets ES_*, o build sai SEM assinatura, como antes.
+      ASSINAR: ${{ secrets.ES_CREDENTIAL_ID != '' }}
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Ler versões do flutter-build.yml oficial desta tag
+        shell: bash
+        run: |
+          for k in SCITER_RUST_VERSION LLVM_VERSION FLUTTER_VERSION VCPKG_COMMIT_ID VERSION; do
+            v=$(grep -m1 -E "^  $k: \"" .github/workflows/flutter-build.yml | sed -E 's/^[^"]*"([^"]*)".*/\1/')
+            [ -n "$v" ] || { echo "::error::$k não encontrado em flutter-build.yml"; exit 1; }
+            echo "$k=$v" | tee -a "$GITHUB_ENV"
+          done
+
+      - name: Aplicar marca Abratel e servidor fixo
+        shell: bash
+        run: |
+          [ -n "$HALLO_HOST" ] && [ -n "$HALLO_KEY" ] && [ -n "$HALLO_PORTAL" ] || { echo "::error::faltam os secrets HALLO_HOST/HALLO_KEY/HALLO_PORTAL"; exit 1; }
+          python abratel/aplicar-marca.py --host "$HALLO_HOST" --key "$HALLO_KEY" --portal "$HALLO_PORTAL"
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+
+      # https://github.com/flutter/flutter/issues/155685 (igual ao build oficial)
+      - name: Replace engine with rustdesk custom flutter engine
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+
+      - name: Patch flutter
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+          cd $(dirname $(dirname $(which flutter)))
+          if [[ "3.24.5" == ${{ env.FLUTTER_VERSION }} ]]; then
+            git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: windows-2022
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        shell: bash
+        run: |
+          if ! $VCPKG_ROOT/vcpkg install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do echo "$_1:"; cat "$_1"; done
+            exit 1
+          fi
+
+      - name: Build rustdesk
+        run: |
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive usbmmidd_v2.zip -DestinationPath .
+          Remove-Item -Path usbmmidd_v2\Win32 -Recurse
+          Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat"
+          mv -Force .\usbmmidd_v2 ./rustdesk
+
+          try {
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/rustdesk_printer_driver_v4-1.4.zip -OutFile rustdesk_printer_driver_v4-1.4.zip
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/printer_driver_adapter.zip -OutFile printer_driver_adapter.zip
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/sha256sums -OutFile sha256sums
+            $checksum_driver = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*rustdesk_printer_driver_v4-1.4\.zip$').Matches.Groups[1].Value
+            $downloadsum_driver = Get-FileHash -Path rustdesk_printer_driver_v4-1.4.zip -Algorithm SHA256
+            $checksum_adapter = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*printer_driver_adapter\.zip$').Matches.Groups[1].Value
+            $downloadsum_adapter = Get-FileHash -Path printer_driver_adapter.zip -Algorithm SHA256
+            if ($checksum_driver -eq $downloadsum_driver.Hash -and $checksum_adapter -eq $downloadsum_adapter.Hash) {
+              Expand-Archive rustdesk_printer_driver_v4-1.4.zip -DestinationPath .
+              mkdir ./rustdesk/drivers
+              mv -Force .\rustdesk_printer_driver_v4-1.4 ./rustdesk/drivers/RustDeskPrinterDriver
+              Expand-Archive printer_driver_adapter.zip -DestinationPath .
+              mv -Force .\printer_driver_adapter.dll ./rustdesk
+            } else {
+              Write-Output "Printer driver checksums do not match, ignoring."
+            }
+          } catch {
+            Write-Host "Ignoring the printer driver error."
+          }
+
+      - name: find Runner.res
+        continue-on-error: true
+        shell: bash
+        run: |
+          runner_res=$(find . -name "Runner.res");
+          if [ -n "$runner_res" ]; then cp $runner_res ./libs/portable/Runner.res; fi
+
+      - name: Download RustDeskTempTopMostWindow artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: topmostwindow-artifacts-x64
+          path: "./rustdesk"
+
+      - name: Conferir marca no executável
+        shell: powershell
+        run: |
+          $v = (Get-Item .\rustdesk\rustdesk.exe).VersionInfo
+          $v | Format-List ProductName, FileDescription, CompanyName, ProductVersion
+          if ($v.ProductName -ne 'Abratel Suporte') { throw "ProductName = '$($v.ProductName)'" }
+          # Nome, servidor e chave já foram garantidos no código pelo aplicar-marca.py (falha se não casar).
+          # A busca abaixo é só informativa: com otimização, o compilador pode gravar strings curtas
+          # em pedaços dentro das instruções (ex.: "AbratelSuporte".to_owned()), e aí o texto inteiro não aparece.
+          $cfg = Get-Content -Raw libs\hbb_common\src\config.rs
+          foreach ($s in @('RwLock::new("AbratelSuporte"', '"hide-network-settings"', ('&["' + $env:HALLO_HOST + '"]'), ('"' + $env:HALLO_KEY + '"'))) {
+            if (-not $cfg.Contains($s)) { throw "config.rs não contém $s" }
+          }
+          $dll = [IO.File]::ReadAllBytes("$PWD\rustdesk\librustdesk.dll")
+          $txt = [Text.Encoding]::ASCII.GetString($dll)
+          foreach ($s in @('AbratelSuporte', 'AbratelS', $env:HALLO_HOST, $env:HALLO_KEY)) {
+            Write-Output ("librustdesk.dll contém '{0}': {1}" -f $s, $txt.Contains($s))
+          }
+          Write-Output "OK"
+
+      # Assina o programa e a DLL que vão dentro do pacote (o que fica instalado no PC do cliente).
+      - name: Assinar rustdesk.exe
+        if: env.ASSINAR == 'true'
+        uses: SSLcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b # v1.3.2
+        with:
+          command: sign
+          username: ${{ secrets.ES_USERNAME }}
+          password: ${{ secrets.ES_PASSWORD }}
+          credential_id: ${{ secrets.ES_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.ES_TOTP_SECRET }}
+          file_path: ${{ github.workspace }}/rustdesk/rustdesk.exe
+          override: true
+          malware_block: false
+          environment_name: PROD
+
+      - name: Assinar librustdesk.dll
+        if: env.ASSINAR == 'true'
+        uses: SSLcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b # v1.3.2
+        with:
+          command: sign
+          username: ${{ secrets.ES_USERNAME }}
+          password: ${{ secrets.ES_PASSWORD }}
+          credential_id: ${{ secrets.ES_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.ES_TOTP_SECRET }}
+          file_path: ${{ github.workspace }}/rustdesk/librustdesk.dll
+          override: true
+          malware_block: false
+          environment_name: PROD
+
+      - name: Build self-extracted executable
+        shell: bash
+        run: |
+          # Nome interno do .exe = APP_NAME: processo "AbratelSuporte.exe" e pasta própria
+          # (não divide %LOCALAPPDATA%\rustdesk com um RustDesk oficial na mesma máquina).
+          mv ./rustdesk/rustdesk.exe "./rustdesk/$APP_EXE"
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e "../../rustdesk/$APP_EXE"
+          popd
+          mkdir -p ./saida
+          mv ./target/release/rustdesk-portable-packer.exe "./saida/AbratelSuporte-${VERSION}-x86_64.exe"
+          echo "SAIDA_EXE=saida/AbratelSuporte-${VERSION}-x86_64.exe" >> "$GITHUB_ENV"
+
+      # Assina o .exe que o cliente baixa: é ele que o SmartScreen confere.
+      - name: Assinar o instalador
+        if: env.ASSINAR == 'true'
+        uses: SSLcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b # v1.3.2
+        with:
+          command: sign
+          username: ${{ secrets.ES_USERNAME }}
+          password: ${{ secrets.ES_PASSWORD }}
+          credential_id: ${{ secrets.ES_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.ES_TOTP_SECRET }}
+          file_path: ${{ github.workspace }}/${{ env.SAIDA_EXE }}
+          override: true
+          malware_block: false
+          environment_name: PROD
+
+      - name: Conferir assinatura
+        if: env.ASSINAR == 'true'
+        shell: powershell
+        run: |
+          foreach ($f in @($env:SAIDA_EXE, 'rustdesk\AbratelSuporte.exe', 'rustdesk\librustdesk.dll')) {
+            $a = Get-AuthenticodeSignature $f
+            Write-Output ("{0}: {1} - {2}" -f $f, $a.Status, $a.SignerCertificate.Subject)
+            if ($a.Status -ne 'Valid') { throw "assinatura inválida em $f" }
+          }
+
+      - name: SHA256
+        shell: bash
+        run: sha256sum ./saida/*.exe | tee ./saida/SHA256SUMS.txt
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: abratel-suporte-windows-x86_64
+          path: ./saida
+          if-no-files-found: error
+          retention-days: 30
